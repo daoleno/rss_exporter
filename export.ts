@@ -7,50 +7,32 @@ import { Feed, parseFeed } from "https://deno.land/x/rss@0.5.6/mod.ts";
 import { parse as parseXML } from "https://deno.land/x/xml@2.0.4/mod.ts";
 
 const parsedArgs = parse(args);
-const databaseUrl = Deno.env.get("DATABASE_URL")!;
-const pool = new postgres.Pool(databaseUrl, 3, true);
-
-// Connect to the database
-const connection = await pool.connect();
-try {
-  // Create the table
-  await connection.queryObject`
-    CREATE TABLE IF NOT EXISTS feeds (
-      title TEXT,
-      description TEXT,
-      link TEXT,
-      id TEXT,
-      author TEXT,
-      published TEXT,
-      updated TEXT,
-      category TEXT,
-      content TEXT,
-      comments TEXT,
-      source TEXT,
-      contributors TEXT,
-      rights TEXT,
-      attachments TEXT
-    )
-  `;
-} finally {
-  // Release the connection back into the pool
-  connection.release();
-}
 
 function displayHelpMsg() {
-  return "flags:\n-h, --help: display help message\n-s, --source: rss opml file\n";
+  return `Example: deno run --allow-read --allow-net --allow-env export.ts -s RAW.opml -d postgresql://localhost:5432
+flags:
+  -h, --help: display help message
+  -s, --source: rss opml file
+  -d, --database: database url`;
 }
 
-async function getRSSFeed(opmlFile: string) {
+async function getRSSFeed(opmlFile: string, connection: postgres.PoolClient) {
+  // create table if not exists
+  await createTable(connection);
+
   // get feeds url
   const feesUrl = getFeedsUrl(opmlFile);
 
-  // get real feeds
+  // get real feeds and write to database
   for (const url of feesUrl) {
-    const text = await (await fetch(url)).text();
-    const feed = await parseFeed(text);
-    log.info(`fetched ${feed.entries.length} entries from ${url}`);
-    writeToDatabase(feed);
+    try {
+      const text = await (await fetch(url)).text();
+      const feed = await parseFeed(text);
+      log.info(`fetched ${feed.entries.length} entries from ${url}`);
+      await writeToDatabase(connection, feed);
+    } catch (error) {
+      log.error(error);
+    }
   }
 }
 
@@ -66,45 +48,61 @@ function getFeedsUrl(opmlFileName: string) {
   return feedsUrl.flat();
 }
 
-function writeToDatabase(feed: Feed) {
+async function createTable(connection: postgres.PoolClient) {
+  try {
+    // Create the table
+    await connection.queryObject`
+      CREATE TABLE IF NOT EXISTS feeds (
+        title TEXT,
+        description TEXT,
+        link TEXT,
+        id TEXT,
+        author TEXT,
+        published TEXT,
+        updated TEXT,
+        category TEXT,
+        content_type TEXT,
+        content_value TEXT,
+        comments TEXT,
+        source TEXT,
+        contributors TEXT,
+        rights TEXT,
+        attachments TEXT
+      )
+    `;
+    // Create Unique Index
+    await connection.queryObject`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_feeds_id ON feeds (id)
+    `;
+  } finally {
+    // Release the connection back into the pool
+    connection.release();
+  }
+}
+
+async function writeToDatabase(connection: postgres.PoolClient, feed: Feed) {
   try {
     for (const entry of feed.entries) {
-      const {
-        title,
-        description,
-        links,
-        id,
-        author,
-        published,
-        updated,
-        categories,
-        content,
-        comments,
-        source,
-        contributors,
-        rights,
-        attachments,
-      } = entry;
-      const values = [
-        title,
-        description,
-        links[0].href,
-        id,
-        author,
-        published,
-        updated,
-        categories,
-        content,
-        comments,
-        source,
-        contributors,
-        rights,
-        attachments,
-      ];
-      const query = `INSERT INTO feeds VALUES (${values.map(
-        (value) => `'${value}'`
-      )})`;
-      connection.queryObject(query);
+      await connection.queryObject
+        `INSERT INTO feeds (title, description, link, id, author, published, updated, category, content_type, content_value, comments, source, contributors, rights, attachments) 
+          VALUES (
+            ${entry.title?.value}, 
+            ${entry.description?.value}, 
+            ${entry.links[0].href},
+            ${entry.id}, 
+            ${entry.author?.name}, 
+            ${entry.published}, 
+            ${entry.updated}, 
+            ${JSON.stringify(entry.categories)}, 
+            ${entry.content?.type}, 
+            ${entry.content?.value}, 
+            ${entry.comments},
+            ${JSON.stringify(entry.source)}, 
+            ${JSON.stringify(entry.contributors)}, 
+            ${JSON.stringify(entry.rights)}, 
+            ${JSON.stringify(entry.attachments)}) 
+            ON CONFLICT (id) DO NOTHING`;
+      log.info(`inserted entry ${entry.title?.value}, ${entry.id}`);
     }
   } catch (error) {
     console.log(error);
@@ -120,9 +118,19 @@ async function main() {
       console.log(displayHelpMsg());
       break;
     case "source":
-    case "s": {
-      const opml = parsedArgs.s || parsedArgs.source || "";
-      await getRSSFeed(opml);
+    case "s":
+    case "database":
+    case "d": {
+      const opmlFile = parsedArgs.source || parsedArgs.s;
+      const databaseUrl = parsedArgs.database || parsedArgs.d;
+      if (opmlFile && databaseUrl) {
+        // init pg client
+        const pool = new postgres.Pool(databaseUrl, 3, true);
+        const connection = await pool.connect();
+        await getRSSFeed(opmlFile, connection);
+      } else {
+        console.log(displayHelpMsg());
+      }
       break;
     }
     default:
